@@ -1,0 +1,25 @@
+[project]
+name = "model-client"
+version = "0.1.0"
+description = "Ask a model, and run its tool calls through the local MCP gateway."
+readme = "README.md"
+authors = [
+    { email = "49579342+laurenJ7892@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3.0",
+    "openai>=3.55.0",
+]
+
+[project.scripts]
+model-client = "model_client:main"
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.3",
+]
