@@ -1,36 +1,31 @@
-"""List gateway tools, ask the model, and run the calls it makes."""
+"""Ask the model in turns and carry out the calls it makes."""
 
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Callable
-from typing import Any, NoReturn
+from typing import Any
 
 from model_client.errors import ClientError, as_client_error
-from model_client.gateway import (
-    call_tool,
-    function_tools,
-    gateway_directory,
-    list_tools,
-    open_gateway,
-    tool_records,
-)
-from model_client.log import Transcript
+from model_client.gateway import gateway_directory, open_gateway
+from model_client.log import Transcript, report
 from model_client.model import MODEL, ModelReply, ask, build_client
+from model_client.retry import Approve, carry_out, confirm_approval
+from model_client.tools import function_tools, list_tools, tool_records
 
 MAX_TRIES = 4
 SYSTEM = (
     "Answer by calling the listed tools. Send the user's text as the tool argument."
 )
+Complete = Callable[[list[dict[str, Any]], list[dict[str, Any]]], ModelReply]
 
 
-async def run(prompt: str, log: Transcript) -> str:
+async def run(prompt: str, log: Transcript, api_key: str, tries: int) -> str:
     """Run one prompt through the live gateway and the live model."""
     held: ClientError | None = None
     try:
         directory = gateway_directory()
-        client = build_client()
+        client = build_client(api_key)
     except ClientError as exc:
         held = exc
     except Exception as exc:  # noqa: BLE001
@@ -43,7 +38,6 @@ async def run(prompt: str, log: Transcript) -> str:
             return ask(client, messages, tools)
 
         try:
-            tries = max_tries()
             async with open_gateway(directory) as session:
                 try:
                     return await converse(
@@ -68,9 +62,10 @@ async def converse(
     prompt: str,
     *,
     session: Any,
-    complete: Callable[[list[dict[str, Any]], list[dict[str, Any]]], ModelReply],
+    complete: Complete,
     log: Transcript,
     max_tries: int = MAX_TRIES,
+    approve: Approve | None = None,
 ) -> str:
     """Offer `session`'s tools to the model and carry out each call."""
     try:
@@ -80,123 +75,110 @@ async def converse(
             complete=complete,
             log=log,
             max_tries=max_tries,
+            approve=confirm_approval if approve is None else approve,
         )
     except ClientError as exc:
         report(log, exc)
+    except Exception as exc:  # noqa: BLE001
+        report(log, as_client_error(exc))
 
 
 async def _converse(
     prompt: str,
     *,
     session: Any,
-    complete: Callable[[list[dict[str, Any]], list[dict[str, Any]]], ModelReply],
+    complete: Complete,
     log: Transcript,
     max_tries: int,
+    approve: Approve,
 ) -> str:
-    tools = await list_tools(session)
-    log.write(
-        "tools_listed",
-        model=MODEL,
-        prompt=prompt,
-        instructions=SYSTEM,
-        tools=tool_records(tools),
-    )
-    functions = function_tools(tools)
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM},
-        {"role": "user", "content": prompt},
-    ]
-    failures: list[str] = []
-    gateway_refused = False
+    messages, functions = await _prepare(session, prompt, log)
+    repairs = 0
     for round_index in range(1, max_tries + 1):
-        reply = await asyncio.to_thread(complete, messages, functions)
-        log.write(
-            "model_response",
-            round=round_index,
-            content=reply.content,
-            tool_calls=[_call_record(call) for call in reply.tool_calls],
-        )
-        messages.append(reply.message())
+        reply = await _ask(complete, messages, functions, log, round_index)
         if not reply.tool_calls:
-            if failures:
-                raise _failure_error(failures, gateway_refused)
-            text = reply.content or ""
-            log.write("final", stop="final", content=text)
-            return text
-        if round_index == max_tries:
-            if failures:
-                raise _failure_error(failures, gateway_refused)
-            pending = ", ".join(call.name for call in reply.tool_calls)
-            raise ClientError(
-                "loop",
-                f"Stopped after {max_tries} tries with {pending} still pending.",
-            )
-        for call in reply.tool_calls:
-            text, fields = await _perform(session, call)
-            log.write(
-                "tool_result",
-                round=round_index,
-                name=call.name,
-                arguments=(
-                    call.arguments if call.arguments is not None else call.raw_arguments
-                ),
-                **fields,
-            )
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
-            if fields.get("ok") is False:
-                message = fields.get("message")
-                failures.append(
-                    message if isinstance(message, str) and message else call.name
-                )
-                if "code" in fields or fields.get("is_error") is True:
-                    gateway_refused = True
+            return _answer(log, reply)
+        _stop_on_last_try(round_index, max_tries, reply)
+        repairs = await _use_tools(
+            session,
+            reply,
+            messages,
+            log=log,
+            round_index=round_index,
+            approve=approve,
+            repairs=repairs,
+        )
     raise ClientError("loop", "The loop ended without a final answer.")
 
 
-def max_tries() -> int:
-    """Return the try limit for this run.
-
-    Read `TRIES` from the environment. Use 4 when `TRIES` is unset.
-    """
-    raw = os.environ.get("TRIES")
-    if raw is None or raw.strip() == "":
-        return MAX_TRIES
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value < 1 or value > MAX_TRIES:
-        raise ClientError("loop", "TRIES must be an integer from 1 to 4.")
-    return value
-
-
-def _failure_error(failures: list[str], gateway_refused: bool) -> ClientError:
-    source = "gateway" if gateway_refused else "loop"
-    return ClientError(source, "; ".join(failures))
+async def _prepare(
+    session: Any, prompt: str, log: Transcript
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """List the gateway tools and build the first messages."""
+    tools = await list_tools(session)
+    log.tools_listed(
+        model=MODEL,
+        instructions=SYSTEM,
+        tools=tool_records(tools),
+    )
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": prompt},
+    ]
+    return messages, function_tools(tools)
 
 
-def report(log: Transcript, error: ClientError) -> NoReturn:
-    """Write `error` to the log, then raise it.
-
-    When the write fails, raise the original error.
-    """
-    try:
-        log.record(error)
-    except ClientError:
-        pass
-    raise error
-
-
-def _call_record(call: Any) -> dict[str, Any]:
-    arguments = call.arguments if call.arguments is not None else call.raw_arguments
-    record: dict[str, Any] = {"id": call.id, "name": call.name, "arguments": arguments}
-    if call.error:
-        record["error"] = call.error
-    return record
+async def _ask(
+    complete: Complete,
+    messages: list[dict[str, Any]],
+    functions: list[dict[str, Any]],
+    log: Transcript,
+    round_index: int,
+) -> ModelReply:
+    """Record one model reply and keep it on the message list."""
+    reply = await asyncio.to_thread(complete, messages, functions)
+    log.model_response(round_index, reply.content, reply.tool_calls)
+    messages.append(reply.message())
+    return reply
 
 
-async def _perform(session: Any, call: Any) -> tuple[str, dict[str, Any]]:
-    if call.error or call.arguments is None:
-        message = call.error or "Tool arguments must be a JSON object."
-        return message, {"ok": False, "message": message}
-    return await call_tool(session, call.name, call.arguments)
+def _answer(log: Transcript, reply: ModelReply) -> str:
+    """Record the model's text and return it."""
+    text = reply.content or ""
+    log.final(text)
+    return text
+
+
+def _stop_on_last_try(round_index: int, max_tries: int, reply: ModelReply) -> None:
+    """Stop when this try still asks for tools and no try remains."""
+    if round_index < max_tries:
+        return
+    pending = ", ".join(call.name for call in reply.tool_calls)
+    raise ClientError(
+        "loop",
+        f"Stopped after {max_tries} tries with {pending} still pending.",
+    )
+
+
+async def _use_tools(
+    session: Any,
+    reply: ModelReply,
+    messages: list[dict[str, Any]],
+    *,
+    log: Transcript,
+    round_index: int,
+    approve: Approve,
+    repairs: int,
+) -> int:
+    """Run each call in this reply. Return the repair count."""
+    for call in reply.tool_calls:
+        text, repairs = await carry_out(
+            session,
+            call,
+            log=log,
+            round_index=round_index,
+            approve=approve,
+            repairs=repairs,
+        )
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
+    return repairs

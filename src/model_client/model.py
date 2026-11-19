@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from openai import APIError, APIStatusError, OpenAI
@@ -52,24 +50,11 @@ class ModelReply:
         return payload
 
 
-def load_env() -> None:
-    """Load this project's `.env`. Set a variable only when it is unset."""
-    start = Path(__file__).resolve().parent
-    for parent in (start, *start.parents):
-        if (parent / "pyproject.toml").is_file() and (parent / "src").is_dir():
-            env_file = parent / ".env"
-            if env_file.is_file():
-                _apply_env(env_file)
-            return
-
-
-def build_client() -> OpenAI:
+def build_client(api_key: str) -> OpenAI:
     """Return an OpenAI client for the xAI chat completions endpoint."""
-    load_env()
-    key = os.environ.get("XAI_API_KEY")
-    if not key:
+    if not api_key:
         raise ClientError("model", "Set XAI_API_KEY.")
-    return OpenAI(api_key=key, base_url=XAI_BASE_URL, timeout=180.0)
+    return OpenAI(api_key=api_key, base_url=XAI_BASE_URL, timeout=180.0)
 
 
 def ask(
@@ -95,7 +80,11 @@ def ask(
 
 
 def error_message(exc: APIStatusError) -> str:
-    """Return the provider's error text from the response body."""
+    """Return the provider's error text from the response body.
+
+    This stays next to `ask`. The body belongs to the OpenAI client, and
+    `errors` does not import that client.
+    """
     response = getattr(exc, "response", None)
     body: Any = None
     if response is not None:
@@ -163,17 +152,3 @@ def _text(content: Any) -> str | None:
                 parts.append(text)
         return "".join(parts)
     return str(content)
-
-
-def _apply_env(path: Path) -> None:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        detail = exc.strerror or str(exc)
-        raise ClientError("model", f"Could not read {path.name}: {detail}") from exc
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, value = stripped.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))

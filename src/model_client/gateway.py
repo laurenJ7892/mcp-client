@@ -1,14 +1,11 @@
-"""Call the word-counter gateway over stdio."""
+"""Start the word-counter gateway over stdio."""
 
 from __future__ import annotations
 
-import json
+import tomllib
 from pathlib import Path
-from typing import Any
 
 from mcp import Client, StdioServerParameters
-from mcp.shared.exceptions import MCPError
-from mcp.types import Tool
 
 from model_client.errors import ClientError
 
@@ -16,8 +13,8 @@ _GATEWAY_PACKAGE = Path("agent-trust-gateway") / "gateway"
 
 
 def gateway_directory() -> Path:
-    """Return `agent-trust-gateway/gateway` above this package."""
-    return _discover_gateway()
+    """Return `../../agent-trust-gateway/gateway` from this project."""
+    return _discover_gateway(Path(__file__).resolve().parent)
 
 
 def server_parameters(directory: Path) -> StdioServerParameters:
@@ -40,93 +37,51 @@ def open_gateway(directory: Path) -> Client:
     return Client(server_parameters(directory))
 
 
-async def list_tools(session: Any) -> list[Tool]:
-    """Follow `tools/list` cursors until the server has no further page."""
-    tools: list[Tool] = []
-    cursor: str | None = None
-    while True:
-        try:
-            page = await session.list_tools(cursor=cursor)
-        except MCPError as exc:
-            raise ClientError(
-                "gateway", f"tools/list failed ({exc.code}): {exc.message}"
-            ) from exc
-        except Exception as exc:
-            raise ClientError("gateway", f"tools/list failed: {exc}") from exc
-        tools.extend(page.tools)
-        cursor = page.next_cursor
-        if not cursor:
-            return tools
+def _discover_gateway(start: Path) -> Path:
+    """Return `../../agent-trust-gateway/gateway` from this project.
 
-
-def tool_records(tools: list[Tool]) -> list[dict[str, Any]]:
-    """Names, descriptions, and input schemas offered to the model."""
-    return [
-        {
-            "name": tool.name,
-            "description": tool.description,
-            "input_schema": tool.input_schema,
-        }
-        for tool in tools
-    ]
-
-
-def function_tools(tools: list[Tool]) -> list[dict[str, Any]]:
-    """Chat-completions function tools for an xAI request."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.input_schema,
-            },
-        }
-        for tool in tools
-    ]
-
-
-async def call_tool(
-    session: Any, name: str, arguments: dict[str, Any]
-) -> tuple[str, dict[str, Any]]:
-    """Call one tool. Return text for the model and fields for the log.
-
-    A JSON-RPC error returns JSON with `code` and `message`. An `is_error`
-    result returns the tool content.
+    The directory must be real. The project name must be `gateway`.
+    `src/gateway/server.py` must exist.
     """
+    root = _project_root(start)
+    gateway = root.parent.parent / _GATEWAY_PACKAGE
+    package = gateway.parent
+    if package.is_symlink() or gateway.is_symlink():
+        raise ClientError("gateway", "The gateway checkout is a symlink.")
+    if not gateway.is_dir():
+        raise ClientError(
+            "gateway",
+            "The gateway checkout agent-trust-gateway/gateway is missing.",
+        )
+    if _project_name(gateway / "pyproject.toml") != "gateway":
+        raise ClientError("gateway", "The gateway project name is not gateway.")
+    server = gateway / "src" / "gateway" / "server.py"
+    if not server.is_file():
+        raise ClientError(
+            "gateway", "The gateway checkout has no src/gateway/server.py."
+        )
+    return gateway.resolve()
+
+
+def _project_name(path: Path) -> str | None:
+    """Return the `[project].name` value, or None when the file is unusable."""
     try:
-        result = await session.call_tool(name, arguments)
-    except MCPError as exc:
-        text = json.dumps({"code": exc.code, "message": exc.message})
-        return text, {"ok": False, "code": exc.code, "message": exc.message}
-    except Exception as exc:
-        raise ClientError("gateway", str(exc)) from exc
-    if result.is_error:
-        text = _content_text(result)
-        return text, {"ok": False, "is_error": True, "message": text}
-    if result.structured_content is not None:
-        text = json.dumps(result.structured_content)
-        return text, {"ok": True, "structured_content": result.structured_content}
-    text = _content_text(result)
-    return text, {"ok": True, "content": text}
+        with path.open("rb") as handle:
+            data = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    project = data.get("project")
+    if not isinstance(project, dict):
+        return None
+    name = project.get("name")
+    if not isinstance(name, str):
+        return None
+    return name
 
 
-def _discover_gateway() -> Path:
-    start = Path(__file__).resolve().parent
+def _project_root(start: Path) -> Path:
+    """The directory that holds this project's `pyproject.toml` and `src`."""
     for parent in (start, *start.parents):
-        candidate = parent / _GATEWAY_PACKAGE
-        if (candidate / "pyproject.toml").is_file():
-            return candidate
-    raise ClientError(
-        "gateway",
-        "The gateway checkout is missing (agent-trust-gateway/gateway).",
-    )
-
-
-def _content_text(result: Any) -> str:
-    parts: list[str] = []
-    for block in result.content:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
-    return "\n".join(parts)
+        if (parent / "pyproject.toml").is_file() and (parent / "src").is_dir():
+            return parent
+    raise ClientError("gateway", "Could not find the model-client project.")
